@@ -650,6 +650,85 @@ curl -X POST http://localhost:8000/api/v1/mass-calibrate \
        "mz":[181.071]}'
 ```
 
+### `POST /api/v1/isotope-clusters`
+
+**未知质谱同位素簇检测**（不需要分子式）：给定按 m/z 严格递增的质心峰、电荷范围 `min_charge`～`max_charge`（均在 1～10 内）、间距容差 `spacing_tolerance` 与最少成员数 `min_peaks`，在每个候选电荷 *z* 下以固定名义步长
+
+```
+step(z) = 1.003354835 / z
+```
+
+（¹³C−¹²C 中子质量差按电荷均分的 m/z 间距）枚举同位素链：
+
+1. **候选生成**：每个峰都可作为簇的单同位素（最低 m/z）成员向后生长。相邻成员的名义间隔可以跨 **1 步或 2 步**，且实测间隔与对应整数步长之差的绝对值 **不得超过** `spacing_tolerance`（闭区间）；跨 2 步表示中间恰好缺一位同位素，**每条候选链至多包含一次** 2 步跳跃。成员数达到 `min_peaks` 的链（及其每一条合格前缀）都是候选。
+2. **强度得分**：输入强度先按全谱基峰归一化（最高强度 = 100；全零谱按 0 处理）。候选得分 = 成员归一化强度之和 **− 10 × 缺失位数**。
+3. **加权区间动态规划**：候选占用的资源是其成员在峰列表中的**闭索引区间** `[首成员, 末成员]`；选出索引跨度互不重叠（前一簇末索引 < 后一簇首索引）且**总得分最高**的候选集合。总分相同时依次取：成员总数更多 → 各簇单同位素 m/z 组成的序列字典序更小 → 电荷序列更小。
+4. 返回每个选中簇的电荷、单同位素 m/z、得分、成员在输入峰列表中的 0 基索引、缺失位（相对单同位素成员的 0 基名义同位素位置），以及不属于任何簇的**未分配峰索引**。没有合格候选时正常返回 200，簇列表为空、所有峰均未分配。
+
+请求体：
+
+```json
+{
+  "peaks": [
+    {"mz": 100.0, "intensity": 100.0},
+    {"mz": 101.003355, "intensity": 60.0},
+    {"mz": 102.00671, "intensity": 10.0},
+    {"mz": 103.010065, "intensity": 2.0},
+    {"mz": 150.0, "intensity": 1.0}
+  ],
+  "min_charge": 1,
+  "max_charge": 10,
+  "spacing_tolerance": 0.005,
+  "min_peaks": 3
+}
+```
+
+- `peaks`（必填，**1～200 个**）：质心峰，字段为 `mz`/`intensity`。m/z 必须**严格递增**（重复或逆序返回带 0 基 `index` 的 422）；强度必须为**非负有限数**（允许 0，允许全零谱；`NaN`/`Infinity` 由请求校验拦截）。
+- `min_charge`（可选，默认 1）/ `max_charge`（可选，默认 10）：整数，均在 **1～10**，且 `min_charge ≤ max_charge`。
+- `spacing_tolerance`（必填，>0 的有限数，m/z 单位）：相邻成员实测间隔与整数名义步长的最大允许偏差。
+- `min_peaks`（必填，**2～200** 的整数）：候选簇至少需要的实测成员数。
+
+响应：
+
+```json
+{
+  "min_charge": 1,
+  "max_charge": 10,
+  "spacing_tolerance": 0.005,
+  "min_peaks": 3,
+  "peak_count": 5,
+  "cluster_count": 1,
+  "clusters": [
+    {
+      "charge": 1,
+      "monoisotopic_mz": 100.0,
+      "score": 172.0,
+      "member_indices": [0, 1, 2, 3],
+      "missing_positions": []
+    }
+  ],
+  "unassigned_peaks": [4]
+}
+```
+
+- `clusters`：按首成员索引升序（谱图从左到右）返回各簇。
+  - `charge`：该簇的电荷状态；`monoisotopic_mz`：首成员（最低 m/z）的 m/z。
+  - `score`：基峰归一化成员强度和减去 10 × 缺失位数。
+  - `member_indices`：成员峰在请求峰列表中的 0 基索引，m/z 升序；不同簇的索引区间互不重叠。
+  - `missing_positions`：因 2 步跳跃而缺失的名义同位素位置（相对单同位素成员的 0 基偏移），为空或仅一个位置。
+- `unassigned_peaks`：未被任何选中簇使用的峰的 0 基索引。
+- **无合格候选**（峰数不足、间距全部超差等）：`clusters` 为 `[]`、`cluster_count` 为 0，全部峰索引出现在 `unassigned_peaks` 中。
+
+含缺失位的示例：峰位于名义位置 0、2、3（第一次相邻间隔跨 2 步）时，`member_indices` 为对应三峰、`missing_positions` 为 `[1]`，得分为三峰归一化强度和 − 10。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/isotope-clusters \
+  -H 'Content-Type: application/json' \
+  -d '{"min_charge":1,"max_charge":10,"spacing_tolerance":0.005,"min_peaks":3,
+       "peaks":[{"mz":100.0,"intensity":100.0},{"mz":101.003355,"intensity":60.0},
+                {"mz":102.00671,"intensity":10.0},{"mz":103.010065,"intensity":2.0}]}'
+```
+
 ### `POST /api/v1/enrichment-fit`
 
 估计分子中单个同位素标记的丰度（富集度）：在 0%～100% 范围内按给定步长网格搜索候选丰度，对每个候选值复用卷积生成归一化包络，与观测峰配对比较，返回均方误差最小的丰度。
@@ -818,7 +897,7 @@ curl -X POST http://localhost:8000/api/v1/mass-calibrate \
 
 - `invalid_label`：标签非法——格式错误（应为 `13C` 形式）、未知元素符号、未知质量数（`position` 为标签字符串中的 0 基字符位置）。
 - `invalid_labels`：双标签组合非法——两个标签属于同一元素（`index` 为标签列表中出错标签的 0 基索引）。
-- `invalid_peaks`：观测峰列表为空、质量非递增或重复（`index` 为出错峰的 0 基索引，空列表时为 `null`）。
+- `invalid_peaks`：观测峰列表为空、质量非递增或重复（`index` 为出错峰的 0 基索引，空列表时为 `null`）。`/api/v1/isotope-clusters` 复用同一错误结构报告峰 m/z 非严格递增或重复（该接口允许全零强度，不做"至少一个正强度"校验）。
 - `invalid_mass_step`：`/api/v1/neutral-profile` 的 `mass_step` 非正（Pydantic 字段校验同样会拦截 0/负数并指明 `field`）。
 - `invalid_mass_range`：`/api/v1/neutral-profile` 的质量区间为空或反向（`mass_min ≥ mass_max`，含单侧给定时与自动 ±4σ 边界比较的情形）；`field` 为 `mass_min`。
 - `grid_too_large`：统一网格点数超过 20000（放宽 `mass_step` 或缩窄质量区间）；`field` 为 `mass_step`。
@@ -829,6 +908,7 @@ curl -X POST http://localhost:8000/api/v1/mass-calibrate \
 - `no_candidates`：`/api/v1/profile-centroid` 阈值过滤后不存在任何平顶局部极大候选；`field` 为 `relative_threshold`。
 - `search_limit_exceeded`：`/api/v1/formula-search` 的分支限界枚举访问节点超过 100 万（随附 `visited_nodes`、`pruned_branches` 与 `limit`）；收窄元素计数范围或质量容差后重试。
 - `no_valid_points` / `no_valid_point_pairs` / `too_few_inliers` / `non_positive_slope`：`/api/v1/mass-calibrate` 的拟合级失败——有效校准点为空、有效点理论 m/z 全相同无法成对点对、初模内点少于 3 个、最终最小二乘斜率非正，均返回 422 且 `detail.message` 说明原因（内点不足时含实际内点数与 `tolerance_ppm`）。注意：**单个**校准点的分子式/加合物非法不是请求失败，该点以 `valid: false`、`error` 为 `invalid_formula`/`invalid_adduct` 出现在 200 响应中。
+- `too_many_candidates`：`/api/v1/isotope-clusters` 的候选枚举数超过 10 万（通常是 `spacing_tolerance` 过大使大量峰互为后继）；`field` 为 `spacing_tolerance`，应收小容差或增大 `min_peaks` 后重试。该接口其余参数级非法输入（峰数不在 1～200、强度为负或非有限、电荷超出 1～10 或范围倒置、`spacing_tolerance` 非正或非有限、`min_peaks` 超出 2～200）由请求校验返回标准 422 并指明字段位置；无合格候选不是错误，而是 200 响应中 `clusters` 为空。
 
   ```json
   {
@@ -881,5 +961,6 @@ pytest                                 # 运行测试
 - **富集拟合**：对每个候选丰度 p（0%～100% 按步长网格搜索），将被标记元素的同位素分布替换为"标记同位素占 p、其余天然同位素按比例分享 1−p"，复用同一套卷积生成归一化包络（基峰=100，观测峰同样归一化）；观测峰与容差内最近的预测峰贪心配对，未匹配峰强度按 0 计，以全部配对的强度均方误差最小者为最佳丰度，同分取较低丰度。除被拟合元素外其余元素的包络与候选丰度无关，只计算一次。
 - **双元素联合拟合**：`POST /api/v1/dual-enrichment-fit` 在两个不同元素标签的丰度上做二维网格搜索，组合两种富集分布后沿用同一套卷积、一对一配对与含未匹配峰的 MSE。与两个候选丰度都无关的"其余元素包络"只卷积一次并在全网格复用；第一元素的富集多项式在其外层丰度固定时只计算一次。MSE 相同按两项丰度（请求顺序）升序字典序取解，`search_points` 为两网格点数之积。
 - **分子式反推**：`POST /api/v1/formula-search`（`app/formula_search.py`）对 2～6 个不重复元素及各自 0～200 的计数闭区间做深度优先分支限界枚举。元素按单同位素质量从重到轻访问；在每个节点用后缀元素最小/最大可贡献质量（`suffix_min`/`suffix_max`）把当前元素的可行计数夹到整数窗口 ⌈…⌉～⌊…⌋ 并与 `[min_count, max_count]` 取交，窗口外的计数值累加为 `pruned_branches` 且不递归（含 1e-10 Da 浮点保护，叶节点再做一次窗口校验）。命中组成用 `ParsedFormula` 复用天然丰度卷积，基峰归一化后用 `pair_and_score` 与同样归一化的观测峰一对一配对，未匹配峰按零强度计入 MSE；候选按 (MSE, |质量误差|, 元素符号字典序分子式) 稳定排序取前 `max_results`，`total_hits` 返回未截断的命中总数。全零组成不命中；访问节点（根计 1）超过 100 万抛出 `SearchLimitExceeded` 由专用异常处理器转 422；无命中返回 200 空候选列表。
+- **未知同位素簇检测**：`POST /api/v1/isotope-clusters`（`app/isotope_clusters.py`）不依赖分子式，对每个候选电荷 z 以名义步长 `1.003354835/z` 从每个峰出发做深度优先的链生长：用二分查找在后继窗口 `[尾峰 + d·步长 ± 容差]`（d ∈ {1,2}）内取下一个成员，d=2 记录一个缺失位且全链至多一次；每条成员数 ≥ `min_peaks` 的前缀都作为候选（相同成员序列去重）。强度按全谱基峰归一化（全零谱按 0 处理），候选得分为成员强度和 − 10 × 缺失位数。选择阶段是两趟后缀加权区间动态规划：第一趟以 `(总分, 成员总数)` 标量键求出各后缀的最优值对（取候选则跳到其末成员索引 +1，否则前移一位）；第二趟在达到最优的候选中比较**完整后缀序列**（先单同位素 m/z 元组字典序、再电荷元组字典序）重建唯一最优解，避免单状态增量 DP 在前缀延长后平局关系翻转的问题。枚举候选超过 10 万抛 `IsotopeClusterError`（`too_many_candidates`）转 422。选中簇按首成员索引升序返回，未出现在任何簇中的峰索引汇总为 `unassigned_peaks`；无合格候选时簇列表为空。
 - **同位素数据**：`app/isotopes.py` 内置约 50 种常见元素的 AME/CIAAW 同位素质量与天然丰度，可按需扩充。
 - **持久化**：SQLite 存计算结果缓存（`envelope_cache`）与请求日志（`request_log`），schema 随服务启动自动创建。
