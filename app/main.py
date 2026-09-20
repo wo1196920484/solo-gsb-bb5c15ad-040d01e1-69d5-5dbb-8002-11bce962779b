@@ -45,6 +45,14 @@ from .formula_search import (
     search_formulas,
 )
 from .identify import IonCandidatePrediction, predict_ion_candidate, score_ion_candidate
+from .isotope_clusters import (
+    MAX_CHARGE as CLUSTER_MAX_CHARGE,
+    MAX_PEAKS as CLUSTER_MAX_PEAKS,
+    MIN_CHARGE as CLUSTER_MIN_CHARGE,
+    MIN_MIN_PEAKS as CLUSTER_MIN_MIN_PEAKS,
+    detect_isotope_clusters,
+    validate_cluster_peaks,
+)
 from .isotopes import ISOTOPES
 from .mixture import fit_ion_mixture, score_mixture
 from .parser import FormulaError, LabelError, parse_formula, parse_label
@@ -75,8 +83,11 @@ app = FastAPI(
         "centroids equally-spaced continuous mass/intensity profiles, "
         "reverse-searches molecular formulas from a target monoisotopic "
         "mass and observed isotope peaks via branch-and-bound enumeration, "
-        "and calibrates the mass axis with a robust median-slope initial "
-        "model followed by an inlier least-squares line."
+        "calibrates the mass axis with a robust median-slope initial "
+        "model followed by an inlier least-squares line, and detects "
+        "unknown charge-state isotope clusters in centroid peak lists by "
+        "neutron-spacing candidate generation plus weighted-interval "
+        "dynamic programming."
     ),
     lifespan=lifespan,
 )
@@ -898,6 +909,138 @@ class MassCalibrateResponse(BaseModel):
     )
     calibrated_mz: list[CalibratedMzOut] = Field(
         ..., description="Calibrated m/z values, kept in request order"
+    )
+
+
+class IsotopeClusterPeakIn(BaseModel):
+    mz: float = Field(
+        ..., description="Centroid m/z; the list must be strictly increasing"
+    )
+    intensity: float = Field(
+        ..., ge=0, description="Non-negative finite centroid peak intensity"
+    )
+
+    @field_validator("mz", "intensity")
+    @classmethod
+    def values_must_be_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("value must be a finite number")
+        return value
+
+
+class IsotopeClustersRequest(BaseModel):
+    peaks: list[IsotopeClusterPeakIn] = Field(
+        ...,
+        min_length=1,
+        max_length=CLUSTER_MAX_PEAKS,
+        description=(
+            f"Centroid peaks, 1-{CLUSTER_MAX_PEAKS} entries, sorted by strictly "
+            "increasing m/z with non-negative finite intensities"
+        ),
+    )
+    charge_min: int = Field(
+        ...,
+        ge=CLUSTER_MIN_CHARGE,
+        le=CLUSTER_MAX_CHARGE,
+        description="Lowest charge state to test (1-10); must not exceed charge_max",
+        examples=[1],
+    )
+    charge_max: int = Field(
+        ...,
+        ge=CLUSTER_MIN_CHARGE,
+        le=CLUSTER_MAX_CHARGE,
+        description="Highest charge state to test (1-10)",
+        examples=[3],
+    )
+    spacing_tolerance: float = Field(
+        ...,
+        gt=0,
+        description=(
+            "Maximum allowed deviation (m/z) between an observed member spacing "
+            "and an integer multiple of 1.003354835/charge"
+        ),
+        examples=[0.005],
+    )
+    min_peaks: int = Field(
+        ...,
+        ge=CLUSTER_MIN_MIN_PEAKS,
+        le=CLUSTER_MAX_PEAKS,
+        description="Minimum number of observed member peaks a cluster must have",
+        examples=[3],
+    )
+
+    @field_validator("spacing_tolerance")
+    @classmethod
+    def tolerance_must_be_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError("spacing_tolerance must be a finite number")
+        return value
+
+    @field_validator("charge_max")
+    @classmethod
+    def charge_range_must_be_ordered(cls, value: int, info) -> int:
+        charge_min = info.data.get("charge_min")
+        if charge_min is not None and value < charge_min:
+            raise ValueError(
+                f"charge_max ({value}) must not be smaller than charge_min "
+                f"({charge_min})"
+            )
+        return value
+
+
+class IsotopeClusterOut(BaseModel):
+    charge: int = Field(..., description="Detected charge state of the cluster")
+    monoisotopic_mz: float = Field(
+        ..., description="m/z of the cluster's first (monoisotopic-position) member"
+    )
+    score: float = Field(
+        ...,
+        description=(
+            "Sum of the base-peak-normalised member intensities (base peak = 100) "
+            "minus 10 per missing isotope position"
+        ),
+    )
+    member_indices: list[int] = Field(
+        ..., description="0-based indices of the member peaks, in m/z order"
+    )
+    missing_positions: list[int] = Field(
+        ...,
+        description=(
+            "1-based nominal isotope positions missing from the cluster "
+            "(0 or 1 entry; at most one missing position per cluster)"
+        ),
+    )
+
+
+class UnassignedPeakOut(BaseModel):
+    index: int = Field(..., description="0-based position of the peak in the request")
+    mz: float
+    intensity: float
+
+
+class IsotopeClustersResponse(BaseModel):
+    charge_min: int
+    charge_max: int
+    spacing_tolerance: float
+    min_peaks: int
+    peak_count: int
+    candidate_count: int = Field(
+        ...,
+        description=(
+            "Number of qualifying candidate clusters generated before the "
+            "non-overlapping weighted-interval selection"
+        ),
+    )
+    cluster_count: int
+    clusters: list[IsotopeClusterOut] = Field(
+        ..., description="Selected clusters in ascending monoisotopic m/z order"
+    )
+    unassigned_peaks: list[UnassignedPeakOut] = Field(
+        ...,
+        description=(
+            "Peaks lying outside every selected cluster's index span "
+            "(first member through last member, inclusive), in request order"
+        ),
     )
 
 
@@ -1762,4 +1905,74 @@ def mass_calibrate(req: MassCalibrateRequest) -> dict:
         "inlier_count": fit.inlier_count,
         "calibration_points": point_out,
         "calibrated_mz": calibrated,
+    }
+
+
+@app.post("/api/v1/isotope-clusters", response_model=IsotopeClustersResponse)
+def isotope_clusters(req: IsotopeClustersRequest) -> dict:
+    """Detect unknown charge-state isotope clusters in centroid peaks.
+
+    Candidate clusters are generated without a molecular formula: at charge
+    ``z`` the nominal member spacing is ``1.003354835 / z``. From each peak
+    as a possible monoisotopic member, a chain is extended greedily to the
+    observed peak whose spacing matches one nominal step within
+    ``spacing_tolerance``; when no such peak exists, a single gap of two
+    nominal steps (exactly one missing isotope position) is allowed per
+    cluster. Every chain prefix with at least ``min_peaks`` members is a
+    candidate.
+
+    Intensities are base-peak normalised (base peak = 100); each candidate
+    scores the sum of its member intensities minus 10 per missing position.
+    A weighted-interval dynamic program then selects the candidates whose
+    index spans (first .. last member, inclusive) do not overlap and whose
+    total score is highest. Score ties resolve to more members, then the
+    lexicographically smaller monoisotopic m/z sequence, then the smaller
+    charge sequence. Peaks outside every selected span are returned as
+    unassigned. With no qualifying candidate the cluster list is empty and
+    every peak is unassigned.
+    """
+    peaks = [(p.mz, p.intensity) for p in req.peaks]
+    validate_cluster_peaks(peaks)
+
+    result = detect_isotope_clusters(
+        peaks,
+        charge_min=req.charge_min,
+        charge_max=req.charge_max,
+        spacing_tolerance=req.spacing_tolerance,
+        min_peaks=req.min_peaks,
+    )
+    clusters = [
+        {
+            "charge": cluster.charge,
+            "monoisotopic_mz": round(cluster.monoisotopic_mz, 6),
+            "score": round(cluster.score, 6),
+            "member_indices": list(cluster.member_indices),
+            "missing_positions": list(cluster.missing_positions),
+        }
+        for cluster in result.clusters
+    ]
+    unassigned = [
+        {"index": peak.index, "mz": peak.mz, "intensity": peak.intensity}
+        for peak in result.unassigned_peaks
+    ]
+
+    db.log_request(
+        f"isotope-clusters:{len(peaks)}-peaks",
+        None,
+        ok=len(clusters) > 0,
+        message=(
+            f"isotope clusters: {result.candidate_count} candidates, "
+            f"{len(clusters)} selected"
+        ),
+    )
+    return {
+        "charge_min": req.charge_min,
+        "charge_max": req.charge_max,
+        "spacing_tolerance": req.spacing_tolerance,
+        "min_peaks": req.min_peaks,
+        "peak_count": len(peaks),
+        "candidate_count": result.candidate_count,
+        "cluster_count": len(clusters),
+        "clusters": clusters,
+        "unassigned_peaks": unassigned,
     }
